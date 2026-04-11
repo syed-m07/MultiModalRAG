@@ -1,0 +1,9 @@
+Engineering Design and Implementation Protocol for Multimodal Video Retrieval-Augmented Generation Systems.docx
+.env
+rag.pdf
+venv
+__pycache__
+*.mp4
+VideoRAG_DB/
+error.txt
+full_code.txt

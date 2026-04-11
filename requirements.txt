@@ -1,0 +1,9 @@
+# Local application dependencies
+lancedb
+streamlit
+transformers
+torch
+Pillow
+groq
+python-dotenv
+ffmpeg-python
