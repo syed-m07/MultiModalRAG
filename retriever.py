@@ -45,9 +45,9 @@ DEFAULT_TOP_K = 5
 RRF_K = 60
 
 # Modality weights for RRF fusion
-VISUAL_WEIGHT = 1.3
-AUDIO_WEIGHT = 1.0
-CAPTION_WEIGHT = 1.5  # Scene captions from BLIP-2 (highest weight)
+VISUAL_WEIGHT = 1.5   # Most important: strict visual confirmation
+CAPTION_WEIGHT = 1.3  # BLIP-2 Scene captions (second most important)
+AUDIO_WEIGHT = 1.0    # Audio transcripts (lowest weight)
 
 # How many candidates to fetch per modality before fusion
 CANDIDATES_PER_MODALITY = 50
