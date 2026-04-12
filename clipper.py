@@ -131,7 +131,7 @@ def extract_clips(
         output_dir: Directory to save the clips.
 
     Returns:
-        List of file paths to the generated clips.
+        Generator yielding file paths to the generated clips as they finish.
     """
     if video_path is None:
         video_path = DEFAULT_VIDEO_PATH
@@ -147,7 +147,7 @@ def extract_clips(
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    clip_paths = []
+    # We no longer accumulate clip_paths, we yield directly
 
     for i, seg in enumerate(segments):
         start = seg["start_time"]
@@ -158,17 +158,15 @@ def extract_clips(
               f"(padded: [{max(0, start - PADDING_BEFORE):.2f}s - {end + PADDING_AFTER:.2f}s])")
 
         extract_single_clip(video_path, start, end, output_path)
-        clip_paths.append(output_path)
 
         # Verify the file was created and has content
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             size_kb = os.path.getsize(output_path) / 1024
             print(f"    -> Saved: {output_path} ({size_kb:.1f} KB)")
+            yield output_path
         else:
             print(f"    -> WARNING: Clip file is empty or missing!")
-
-    print(f"\n{len(clip_paths)} clips extracted to: {output_dir}")
-    return clip_paths
+            yield None
 
 
 # ============================================================
@@ -189,7 +187,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     try:
-        paths = extract_clips(segments=test_segments)
+        paths = list(extract_clips(segments=test_segments))
         print("\nAll clips extracted successfully!")
         for p in paths:
             print(f"  -> {p}")

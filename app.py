@@ -231,21 +231,22 @@ if user_query:
         # Generate and display video clips
         clips_data = []
         if result["clips"] and VIDEO_PATH:
-            with st.spinner("🎬 Cutting video clips..."):
+            with st.status(f"🎬 Cutting {len(result['clips'])} video clips...", expanded=True) as status:
                 try:
-                    clip_paths = extract_clips(
+                    clip_generator = extract_clips(
                         video_path=VIDEO_PATH,
                         segments=result["clips"],
                     )
 
-                    for i, (clip_path, clip_info) in enumerate(zip(clip_paths, result["clips"])):
-                        if os.path.exists(clip_path):
+                    for i, (clip_path, clip_info) in enumerate(zip(clip_generator, result["clips"])):
+                        if clip_path and os.path.exists(clip_path):
                             start_m = int(clip_info["start_time"] // 60)
                             start_s = int(clip_info["start_time"] % 60)
                             end_m = int(clip_info["end_time"] // 60)
                             end_s = int(clip_info["end_time"] % 60)
                             sources_str = ", ".join(clip_info.get("sources", ["unknown"]))
 
+                            # Using st.write inside status makes it appear within the status block instantly
                             st.markdown(f"""<div class="clip-card">
                                 <div class="clip-title">📎 Clip {i+1} — {start_m:02d}:{start_s:02d} → {end_m:02d}:{end_s:02d}</div>
                                 <div class="clip-meta">Sources: {sources_str}</div>
@@ -258,8 +259,11 @@ if user_query:
                                 "end": clip_info["end_time"],
                                 "sources": sources_str,
                             })
+                            
+                    status.update(label="🎬 All clips generated!", state="complete", expanded=False)
 
                 except Exception as e:
+                    status.update(label="⚠️ Error cutting clips", state="error")
                     st.warning(f"⚠️ Could not generate clips: {e}")
 
         elif not VIDEO_PATH:
