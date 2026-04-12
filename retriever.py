@@ -44,9 +44,11 @@ DEFAULT_TOP_K = 5
 # RRF smoothing constant (standard value from literature)
 RRF_K = 60
 
-# Modality weights for RRF fusion (equal = let intersection decide)
-VISUAL_WEIGHT = 1.0
-CAPTION_WEIGHT = 1.0
+# Modality weights for RRF fusion
+# We slightly skew towards Visual because scenes can be silent
+# and captions can hallucinate.
+VISUAL_WEIGHT = 1.2
+CAPTION_WEIGHT = 0.8
 AUDIO_WEIGHT = 1.0
 
 # How many candidates to fetch per modality before fusion
@@ -405,8 +407,17 @@ def retrieve(
     )
 
     # Step 4: Intersection filter — keep only results confirmed
-    # by at least MIN_SOURCES different modalities
-    filtered = [entry for entry in fused if len(entry["sources"]) >= MIN_SOURCES]
+    # by at least MIN_SOURCES different modalities.
+    # Golden Visual Exception: If a scene is a Top 5 pure visual match, keep it
+    # even if audio/caption missed it, preventing bad captions from ruining great visual matches.
+    filtered = []
+    top_visual_threshold = VISUAL_WEIGHT / (RRF_K + 5)
+    
+    for entry in fused:
+        if len(entry["sources"]) >= MIN_SOURCES:
+            filtered.append(entry)
+        elif "visual" in entry["sources"] and entry["rrf_score"] >= top_visual_threshold:
+            filtered.append(entry)
 
     # Fallback: if intersection is too strict and nothing passes,
     # return the top results without filtering

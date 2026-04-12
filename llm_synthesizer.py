@@ -266,23 +266,35 @@ Output: ["Tony Stark assembling red and gold Iron Man armor", "metal suit pieces
     response = _llm_call(system_prompt, user_prompt, temperature=0.4)
 
     # Parse JSON array from LLM response
+    sub_queries = []
     try:
-        # Try direct JSON parse
-        sub_queries = json.loads(response)
-        if isinstance(sub_queries, list):
-            return sub_queries[:NUM_SUB_QUERIES]
+        parsed = json.loads(response)
+        if isinstance(parsed, list):
+            sub_queries = parsed[:NUM_SUB_QUERIES]
     except json.JSONDecodeError:
         pass
 
     # Fallback: try to extract JSON array from response text
-    try:
-        start = response.index("[")
-        end = response.rindex("]") + 1
-        sub_queries = json.loads(response[start:end])
-        if isinstance(sub_queries, list):
-            return sub_queries[:NUM_SUB_QUERIES]
-    except (ValueError, json.JSONDecodeError):
-        pass
+    if not sub_queries:
+        try:
+            start = response.index("[")
+            end = response.rindex("]") + 1
+            parsed = json.loads(response[start:end])
+            if isinstance(parsed, list):
+                sub_queries = parsed[:NUM_SUB_QUERIES]
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+    if sub_queries:
+        # High-Fidelity Query Logic:
+        # If the original query is >= 70% as long as the average sub-query,
+        # it means the user was very descriptive. Keep their exact words!
+        avg_len = sum(len(q.split()) for q in sub_queries) / len(sub_queries)
+        orig_len = len(user_query.split())
+        if orig_len >= (avg_len * 0.7):
+            print(f"  [INFO] User provided a High-Fidelity Query ({orig_len} words vs {avg_len:.1f} avg). Appending it!")
+            sub_queries.append(user_query)
+        return sub_queries
 
     # Last resort: return the original query
     print(f"  [WARN] Query expansion failed, using original query.")
