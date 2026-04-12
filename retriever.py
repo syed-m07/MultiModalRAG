@@ -49,7 +49,7 @@ RRF_K = 60
 # and captions can hallucinate.
 VISUAL_WEIGHT = 1.2
 CAPTION_WEIGHT = 0.8
-AUDIO_WEIGHT = 1.0
+AUDIO_WEIGHT = 0.3
 
 # How many candidates to fetch per modality before fusion
 CANDIDATES_PER_MODALITY = 50
