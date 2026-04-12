@@ -1,4 +1,4 @@
-# 🎬 High-Accuracy Multimodal Video RAG 
+# 🎬 Multimodal Video RAG 
 
 A multimodal AI search engine for long-form video. This system allows users to find highly specific, granular scenes in massive video files (like 2-hour movies) using natural language. It mathematically processes Visuals, Audio, and AI-generated Captions to perform hyper-accurate, high-speed video retrieval, instantly playing the extracted clip in a web interface.
 
@@ -77,4 +77,4 @@ This project requires a pre-indexed LanceDB folder and the source `.mp4` file to
    ```bash
    streamlit run app.py
    ```
-   *Note: Your first query will take ~10-15 seconds as the CLIP model is cached into memory. All subsequent queries will run in under 3 seconds.*
+   *Note: Loading the model will take ~10-15 seconds as the CLIP model is being cached into memory. All subsequent queries will run in under 3 seconds.*
