@@ -47,6 +47,7 @@ RRF_K = 60
 # Modality weights for RRF fusion
 VISUAL_WEIGHT = 1.3
 AUDIO_WEIGHT = 1.0
+CAPTION_WEIGHT = 1.5  # Scene captions from BLIP-2 (highest weight)
 
 # How many candidates to fetch per modality before fusion
 CANDIDATES_PER_MODALITY = 50
@@ -243,21 +244,22 @@ def _cluster_visual_results(
 def _reciprocal_rank_fusion(
     visual_clusters: list[dict],
     audio_results: list[dict],
+    caption_results: list[dict] = None,
     visual_weight: float = VISUAL_WEIGHT,
     audio_weight: float = AUDIO_WEIGHT,
+    caption_weight: float = CAPTION_WEIGHT,
     k: int = RRF_K,
 ) -> list[dict]:
     """
-    Merge visual clusters and audio results using Reciprocal Rank Fusion.
-
-    RRF Score:
-        score(s) = w_visual / (k + rank_visual(s)) + w_audio / (k + rank_audio(s))
+    Merge visual clusters, audio, and caption results using RRF.
 
     Args:
         visual_clusters: Ranked visual clusters from temporal clustering.
         audio_results: Ranked results from audio-only search.
+        caption_results: Ranked results from caption-only search (BLIP-2).
         visual_weight: Weight multiplier for visual scores.
         audio_weight: Weight multiplier for audio scores.
+        caption_weight: Weight multiplier for caption scores.
         k: Smoothing constant (standard: 60).
 
     Returns:
@@ -282,6 +284,16 @@ def _reciprocal_rank_fusion(
             "rrf_score": rrf_score,
             "sources": ["audio"],
         })
+
+    # Score caption results (BLIP-2 scene descriptions)
+    if caption_results:
+        for rank, r in enumerate(caption_results):
+            rrf_score = caption_weight / (k + rank + 1)
+            fused.append({
+                "data": r,
+                "rrf_score": rrf_score,
+                "sources": ["caption"],
+            })
 
     # Sort by fused score (highest first)
     fused.sort(key=lambda x: x["rrf_score"], reverse=True)
@@ -322,12 +334,19 @@ def retrieve(
     visual_results = _search_by_modality(query_vector, "visual", CANDIDATES_PER_MODALITY)
     audio_results = _search_by_modality(query_vector, "audio", CANDIDATES_PER_MODALITY)
 
+    # Step 1b: Search captions if they exist in the DB
+    try:
+        caption_results = _search_by_modality(query_vector, "caption", CANDIDATES_PER_MODALITY)
+    except Exception:
+        caption_results = []  # Graceful fallback if no captions in DB
+
     # Step 2: Cluster visual results into temporal events
     visual_clusters = _cluster_visual_results(visual_results)
 
-    # Step 3: Fuse with RRF
+    # Step 3: Fuse with RRF (now includes captions)
     fused = _reciprocal_rank_fusion(
         visual_clusters, audio_results,
+        caption_results=caption_results,
         visual_weight=visual_weight,
         audio_weight=audio_weight,
     )
