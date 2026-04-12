@@ -34,11 +34,14 @@ USAGE:
 """
 
 import os
+import re
+import glob
 import json
 import time
+import random
 from groq import Groq
 from dotenv import load_dotenv
-from retriever import retrieve, embed_query
+from retriever import retrieve, embed_query, _load_db, _db_table
 
 load_dotenv()
 
@@ -57,6 +60,115 @@ RESULTS_PER_QUERY = 10
 
 # Final number of clips to return after LLM filtering
 MAX_FINAL_CLIPS = 5
+
+# ============================================================
+# Dynamic Movie Context (Idea 1 + Idea 3)
+# ============================================================
+
+_movie_name = None
+_movie_context = None
+
+
+def _extract_movie_name() -> str:
+    """
+    Parse the video filename from the project directory to get
+    a human-readable movie name.
+
+    Example:
+        "Iron.Man.2.2010.1080p.BrRip.x264.YIFY.mp4"
+        -> "Iron Man 2 2010"
+    """
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    mp4_files = glob.glob(os.path.join(project_dir, "*.mp4"))
+
+    if not mp4_files:
+        return "Unknown Video"
+
+    filename = os.path.basename(mp4_files[0])
+    # Strip extension
+    name = os.path.splitext(filename)[0]
+    # Replace dots and underscores with spaces
+    name = name.replace(".", " ").replace("_", " ")
+    # Remove common junk tokens (resolution, codecs, release groups)
+    junk = [
+        r"\b\d{3,4}p\b", r"\bBrRip\b", r"\bBluRay\b", r"\bWEBRip\b",
+        r"\bx264\b", r"\bx265\b", r"\bHEVC\b", r"\bAAC\b",
+        r"\bYIFY\b", r"\bRARBG\b", r"\bSPARKS\b", r"\bANOXMOUS\b",
+        r"\b10bit\b", r"\bHDR\b", r"\bDTS\b", r"\bDD5 1\b",
+    ]
+    for pattern in junk:
+        name = re.sub(pattern, "", name, flags=re.IGNORECASE)
+    # Clean up extra whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def _discover_movie_context() -> str:
+    """
+    Auto-discover what the video is about by sampling random
+    BLIP-2 captions from the database and asking the LLM.
+
+    Returns a 1-2 sentence summary of the video content.
+    """
+    _load_db()
+
+    # Get caption rows for context discovery
+    try:
+        import pyarrow.compute as pc
+        # Use LanceDB's table scan with filter (no vector needed)
+        caption_df = _db_table.to_lance().to_table(
+            filter=pc.field("modality") == "caption",
+            columns=["text"],
+        ).to_pandas()
+        texts = caption_df["text"].tolist()
+    except Exception:
+        # Fallback: get some rows and filter manually
+        try:
+            some_rows = _db_table.head(200).to_pandas()
+            texts = some_rows[some_rows["modality"] == "caption"]["text"].tolist()
+            if not texts:
+                texts = some_rows[some_rows["modality"] == "audio"]["text"].tolist()
+        except Exception:
+            return "No context available."
+
+    if not texts:
+        return "No context available."
+
+    # Sample 5 random entries
+    sample = random.sample(texts, min(5, len(texts)))
+    descriptions = [s[:150] for s in sample]
+
+    prompt = f"""Based on these scene descriptions from a video, write ONE concise sentence describing what this video is about (genre, main characters, setting).
+
+Scene descriptions:
+{chr(10).join(f'- {d}' for d in descriptions)}
+
+One-sentence summary:"""
+
+    return _llm_call(
+        "You are a concise video content analyzer. Respond with exactly one sentence.",
+        prompt,
+        temperature=0.2,
+    )
+
+
+def _get_movie_context() -> tuple[str, str]:
+    """
+    Get or lazily compute the movie name and context.
+    Cached after first call.
+    """
+    global _movie_name, _movie_context
+
+    if _movie_name is None:
+        _movie_name = _extract_movie_name()
+        print(f"  Movie name (from filename): {_movie_name}")
+
+    if _movie_context is None:
+        print(f"  Discovering movie context from captions...")
+        _movie_context = _discover_movie_context()
+        print(f"  Movie context: {_movie_context}")
+
+    return _movie_name, _movie_context
 
 # ============================================================
 # Groq Client
@@ -125,20 +237,29 @@ def expand_query(user_query: str) -> list[str]:
     Returns:
         A list of expanded sub-query strings.
     """
-    system_prompt = """You are a query expansion engine for a Video-RAG system that searches through movie scenes.
+    movie_name, movie_context = _get_movie_context()
+    system_prompt = """You are a query expansion engine for a Video-RAG system that searches through video scenes.
 
-Your job: Take the user's vague query and generate exactly {num} specific, visually descriptive sub-queries that would help find the relevant scenes in a movie.
+The user has uploaded a video titled: "{movie_name}"
+Based on a quick scan, the video's context is: "{movie_context}"
+
+Your job: Take the user's vague query and generate exactly {num} specific, visually descriptive sub-queries that would help find the relevant scenes IN THIS SPECIFIC VIDEO.
 
 Rules:
 - Each sub-query should describe a DIFFERENT visual aspect of the scene
 - Focus on what the scene LOOKS like, not dialogue
 - Be specific about objects, actions, colors, and settings
-- Include character names if relevant
+- Use character names and details RELEVANT TO THIS VIDEO ONLY
+- Do NOT reference characters or events from other movies
 - Return ONLY a JSON array of strings, nothing else
 
 Example:
 User: "suit up scene"
-Output: ["Tony Stark assembling red and gold Iron Man armor", "metal suit pieces flying onto a person's body", "Iron Man helmet closing over face", "robotic arms attaching armor plates in workshop"]""".format(num=NUM_SUB_QUERIES)
+Output: ["Tony Stark assembling red and gold Iron Man armor", "metal suit pieces flying onto a person's body", "Iron Man helmet closing over face", "robotic arms attaching armor plates in workshop"]""".format(
+        movie_name=movie_name,
+        movie_context=movie_context,
+        num=NUM_SUB_QUERIES,
+    )
 
     user_prompt = f'User query: "{user_query}"\nGenerate {NUM_SUB_QUERIES} expanded sub-queries as a JSON array:'
 
@@ -223,6 +344,8 @@ def rerank_results(user_query: str, candidates: list[dict]) -> list[dict]:
     if not candidates:
         return []
 
+    movie_name, movie_context = _get_movie_context()
+
     # Build a readable summary of each candidate for the LLM
     candidate_summaries = []
     for i, r in enumerate(candidates):
@@ -242,18 +365,25 @@ def rerank_results(user_query: str, candidates: list[dict]) -> list[dict]:
 
     system_prompt = """You are a precise video scene filter for a Movie RAG system.
 
+The user has uploaded a video titled: "{movie_name}"
+Video context: "{movie_context}"
+
 Your job: Given the user's original query and a list of candidate scene results, determine which candidates are TRUE matches and which are FALSE POSITIVES.
 
 Rules:
 - A TRUE match must semantically match what the user is ACTUALLY asking for
 - Consider the INTENT behind the query, not just keyword matches
-- If the user asks for "Iron Man suit-up", a villain building their own suit is NOT a match
-- If the user asks for "Tony Stark talking", a scene where someone else talks is NOT a match
-- Be STRICT but fair. When in doubt, keep the result.
+- If the user asks for a hero's "suit-up", a villain building their own suit is NOT a match
+- If the user asks for a specific character, scenes with other characters are NOT matches
+- Be STRICT. When in doubt, REJECT the result.
 - Return ONLY a JSON array of the IDs (integers) of the TRUE matches, sorted by relevance
 - Return at most {max_clips} results
 
-Example output: [2, 0, 5]""".format(max_clips=MAX_FINAL_CLIPS)
+Example output: [2, 0, 5]""".format(
+        movie_name=movie_name,
+        movie_context=movie_context,
+        max_clips=MAX_FINAL_CLIPS,
+    )
 
     user_prompt = f"""User's original query: "{user_query}"
 
@@ -313,6 +443,8 @@ def synthesize_response(user_query: str, filtered_results: list[dict]) -> str:
     if not filtered_results:
         return f"I couldn't find any scenes matching \"{user_query}\" in the video. Try rephrasing your query with more specific visual details."
 
+    movie_name, movie_context = _get_movie_context()
+
     # Build context for the LLM
     scene_descriptions = []
     for i, r in enumerate(filtered_results):
@@ -330,6 +462,9 @@ def synthesize_response(user_query: str, filtered_results: list[dict]) -> str:
 
     system_prompt = """You are a helpful video assistant for a Movie RAG chatbot.
 
+The user has uploaded a video titled: "{movie_name}"
+Video context: "{movie_context}"
+
 Your job: Given the user's query and the matching scenes found in the video, write a brief, conversational response.
 
 Rules:
@@ -337,7 +472,10 @@ Rules:
 - Be concise — 2-4 sentences max
 - Sound natural and helpful, like a movie expert
 - If multiple clips were found, briefly describe what happens in each
-- Do NOT make up information not present in the scene descriptions"""
+- Do NOT make up information not present in the scene descriptions""".format(
+        movie_name=movie_name,
+        movie_context=movie_context,
+    )
 
     user_prompt = f"""User asked: "{user_query}"
 

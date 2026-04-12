@@ -44,10 +44,10 @@ DEFAULT_TOP_K = 5
 # RRF smoothing constant (standard value from literature)
 RRF_K = 60
 
-# Modality weights for RRF fusion
-VISUAL_WEIGHT = 1.5   # Most important: strict visual confirmation
-CAPTION_WEIGHT = 1.3  # BLIP-2 Scene captions (second most important)
-AUDIO_WEIGHT = 1.0    # Audio transcripts (lowest weight)
+# Modality weights for RRF fusion (equal = let intersection decide)
+VISUAL_WEIGHT = 1.0
+CAPTION_WEIGHT = 1.0
+AUDIO_WEIGHT = 1.0
 
 # How many candidates to fetch per modality before fusion
 CANDIDATES_PER_MODALITY = 50
@@ -55,6 +55,15 @@ CANDIDATES_PER_MODALITY = 50
 # Temporal clustering: frames within this many seconds of each
 # other are grouped into the same "event cluster"
 CLUSTER_GAP_SECONDS = 15.0
+
+# Intersection filter: minimum number of modalities that must
+# independently find a scene for it to be considered valid.
+# 2 = at least two of (visual, audio, caption) must agree.
+MIN_SOURCES = 2
+
+# When merging RRF results, two results within this many seconds
+# are considered the "same scene" and their scores are combined.
+MERGE_WINDOW_SECONDS = 15.0
 
 # ============================================================
 # Lazy-loaded globals (initialized once on first call)
@@ -249,56 +258,100 @@ def _reciprocal_rank_fusion(
     audio_weight: float = AUDIO_WEIGHT,
     caption_weight: float = CAPTION_WEIGHT,
     k: int = RRF_K,
+    merge_window: float = MERGE_WINDOW_SECONDS,
 ) -> list[dict]:
     """
-    Merge visual clusters, audio, and caption results using RRF.
+    Merge visual clusters, audio, and caption results using RRF
+    with timestamp-based deduplication.
+
+    Results from different modalities that fall within merge_window
+    seconds of each other are merged into a SINGLE entry with
+    accumulated RRF scores and multiple sources. This enables the
+    intersection filter downstream.
 
     Args:
         visual_clusters: Ranked visual clusters from temporal clustering.
         audio_results: Ranked results from audio-only search.
-        caption_results: Ranked results from caption-only search (BLIP-2).
+        caption_results: Ranked results from caption-only search.
         visual_weight: Weight multiplier for visual scores.
         audio_weight: Weight multiplier for audio scores.
         caption_weight: Weight multiplier for caption scores.
         k: Smoothing constant (standard: 60).
+        merge_window: Seconds within which results are merged.
 
     Returns:
         Combined results sorted by fused RRF score (descending).
     """
-    fused = []
+    # Collect all scored entries with their modality tag
+    raw_entries = []
 
-    # Score visual clusters
     for rank, cluster in enumerate(visual_clusters):
         rrf_score = visual_weight / (k + rank + 1)
-        fused.append({
+        raw_entries.append({
             "data": cluster,
             "rrf_score": rrf_score,
-            "sources": ["visual"],
+            "source": "visual",
+            "timestamp": cluster["timestamp"],
         })
 
-    # Score audio results
     for rank, r in enumerate(audio_results):
         rrf_score = audio_weight / (k + rank + 1)
-        fused.append({
+        raw_entries.append({
             "data": r,
             "rrf_score": rrf_score,
-            "sources": ["audio"],
+            "source": "audio",
+            "timestamp": r["timestamp"],
         })
 
-    # Score caption results (BLIP-2 scene descriptions)
     if caption_results:
         for rank, r in enumerate(caption_results):
             rrf_score = caption_weight / (k + rank + 1)
-            fused.append({
+            raw_entries.append({
                 "data": r,
                 "rrf_score": rrf_score,
-                "sources": ["caption"],
+                "source": "caption",
+                "timestamp": r["timestamp"],
+            })
+
+    # Sort all entries by timestamp for merging
+    raw_entries.sort(key=lambda x: x["timestamp"])
+
+    # Merge entries that are temporally close into unified results
+    merged = []
+    for entry in raw_entries:
+        matched = False
+        for m in merged:
+            if abs(m["timestamp"] - entry["timestamp"]) <= merge_window:
+                # Same scene region: accumulate score and add source
+                m["rrf_score"] += entry["rrf_score"]
+                if entry["source"] not in m["sources"]:
+                    m["sources"].append(entry["source"])
+                # Keep the data with the richest text (caption > audio > visual)
+                if (entry["source"] == "caption" and m["data"]["modality"] != "caption"):
+                    m["text_data"] = entry["data"]
+                elif (entry["source"] == "audio" and m["data"]["modality"] == "visual"):
+                    m["text_data"] = entry["data"]
+                # Expand time range
+                m["start_time"] = min(m["start_time"], entry["data"]["start_time"])
+                m["end_time"] = max(m["end_time"], entry["data"]["end_time"])
+                matched = True
+                break
+
+        if not matched:
+            merged.append({
+                "data": entry["data"],
+                "text_data": entry["data"],  # fallback
+                "rrf_score": entry["rrf_score"],
+                "sources": [entry["source"]],
+                "timestamp": entry["timestamp"],
+                "start_time": entry["data"]["start_time"],
+                "end_time": entry["data"]["end_time"],
             })
 
     # Sort by fused score (highest first)
-    fused.sort(key=lambda x: x["rrf_score"], reverse=True)
+    merged.sort(key=lambda x: x["rrf_score"], reverse=True)
 
-    return fused
+    return merged
 
 
 def retrieve(
@@ -343,7 +396,7 @@ def retrieve(
     # Step 2: Cluster visual results into temporal events
     visual_clusters = _cluster_visual_results(visual_results)
 
-    # Step 3: Fuse with RRF (now includes captions)
+    # Step 3: Fuse with RRF (now merges by timestamp proximity)
     fused = _reciprocal_rank_fusion(
         visual_clusters, audio_results,
         caption_results=caption_results,
@@ -351,24 +404,34 @@ def retrieve(
         audio_weight=audio_weight,
     )
 
-    # Step 4: Extract top_k and clean up
+    # Step 4: Intersection filter — keep only results confirmed
+    # by at least MIN_SOURCES different modalities
+    filtered = [entry for entry in fused if len(entry["sources"]) >= MIN_SOURCES]
+
+    # Fallback: if intersection is too strict and nothing passes,
+    # return the top results without filtering
+    if not filtered:
+        filtered = fused
+
+    # Step 5: Extract top_k and clean up
     cleaned = []
-    for entry in fused[:top_k]:
+    for entry in filtered[:top_k]:
         r = entry["data"]
+        text_r = entry.get("text_data", r)
         result = {
-            "start_time": r["start_time"],
-            "end_time": r["end_time"],
-            "timestamp": r["timestamp"],
-            "text": r["text"],
-            "modality": r["modality"],
-            "scene_id": r["scene_id"],
+            "start_time": entry["start_time"],
+            "end_time": entry["end_time"],
+            "timestamp": entry["timestamp"],
+            "text": text_r["text"],
+            "modality": ", ".join(entry["sources"]),  # show all sources
+            "scene_id": r.get("scene_id", -1),
             "_distance": r.get("_distance", None),
             "rrf_score": entry["rrf_score"],
             "sources": entry["sources"],
         }
 
-        # Add cluster-specific metadata if it's a visual cluster
-        if r["modality"] == "visual":
+        # Add cluster-specific metadata if visual is one of the sources
+        if "visual" in entry["sources"]:
             result["frame_count"] = r.get("frame_count", 1)
             result["cluster_score"] = r.get("cluster_score", 0)
 
